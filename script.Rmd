@@ -1,0 +1,241 @@
+---
+title: "BADM Hackathon"
+author: "Brian Lee, Zongqi Wang, Michael Lee"
+date: "11/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+
+```
+
+
+# Setup
+```{r, warning=FALSE, message=FALSE}
+library(dplyr)
+library(forcats)
+library(mice)
+library(MASS)
+library(corrplot)
+library(randomForest)
+library(ggplot2)
+library(nnet)
+library(glmnet)
+library(gbm)
+library(xgboost)
+library(caret)
+library(effects)
+library(pROC)
+source("BCA_functions_source_file.R")
+```
+
+# Loading Data
+```{r}
+city <- read.csv("CITY_DATASET_ST.csv")
+account <- read.csv("ACCOUNT_DATASET_ST.csv")
+phline <- read.csv("PHLINE_DATASET_ST.csv")
+
+
+str(city)
+str(account)
+str(phline)
+
+
+data <- merge(phline, account, by = "acc_num")
+data <- merge(city, data, by="bill_city")
+
+data$churn <- as.factor(data$churn)
+data$ph_k_date <- as.Date(data$ph_k_date, format = "%Y-%m-%d")
+data$st_date <- as.Date(data$st_date, format = "%Y-%m-%d")
+
+```
+
+
+# Exploratory analysis
+```{r}
+colnames(data)
+summary(data$ph_k_date)
+summary(data$st_date)
+```
+
+## Missing Data
+```{r}
+#summary(data)
+nrow(data)
+#Missing Data
+md.pattern( data, rotate.names = TRUE)
+
+summary(is.na(data$ph_k_date))
+
+curr.date <- as.Date("2019-11-16", format = "%Y-%m-%d")
+data$day_since_st_date <- as.numeric(curr.date-data$st_date)
+data$day_since_ph_date <- as.numeric(curr.date-data$ph_k_date)
+
+dates.data <- data %>% dplyr::select(day_since_ph_date, day_since_st_date) %>% filter(!is.na(day_since_ph_date))
+
+date.corr <- cor(dates.data)
+corrplot(date.corr, method = "number")
+
+# Final decision to remove it
+data$ph_k_date <- NULL
+data$st_date <- NULL
+data$day_since_ph_date <- NULL
+
+```
+
+## Correlation
+```{r}
+corrMatrix <- cor(select_if(data, is.numeric)) 
+corrplot(corrMatrix,method="number",type="lower",
+diag = FALSE,number.cex = 0.7)
+```
+
+### NOTE: serv_tick_m1 and serv_tick_m7 are perferctly collinear
+### NOTE: lond_d_spend and min are highly correlated
+### NOTE: total_pay is correlated from disc_m8
+
+## Feature Engineering
+```{r}
+# Number of phone lines per account
+data %>% dplyr::select(acc_num, ph_num) %>% group_by(acc_num) %>% tally()->acc_num_data
+data <- merge(data, acc_num_data, by="acc_num")
+data$num_ph_per_acc <- data$n
+data$n <- NULL
+data$serv_tick_m1to6 <- NULL
+
+summary(data$data_plan_m8)
+str(data$data_plan_m8)
+
+data$data_plan_m8 <- dplyr::recode(data$data_plan_m8, "10GB($65)" = 10, "15GB($80)" = 15, "25GB($95)" = 25)
+
+data$data_per_used <- data$mon_data/data$data_plan_m8
+summary(data$data_per_used)
+
+```
+
+# Resampling
+```{r}
+data.scaled <- as.data.frame(scale(select_if(data, is.numeric)))
+data$acc_num <- NULL
+data$bill_city <- NULL
+holdout <- data %>% filter(Sample == "Holdout")
+data <- data %>% filter(Sample != "Holdout")
+
+data$Sample <- NULL
+
+train_size = 0.75
+smp_size = floor(train_size*nrow(data))
+
+set.seed(123)
+train_ind <- sample(seq_len(nrow(data)), size = smp_size)
+
+train <- data[train_ind, ]
+test <- data[-train_ind, ]
+
+train.scaled <- data.scaled[train_ind,]
+train.scaled$churn <- data[train_ind, "churn"]
+
+test.scaled <- data.scaled[-train_ind,]
+test.scaled$churn <- data[-train_ind, "churn"]
+head(train)
+```
+# Modelling
+
+## Regression
+```{r}
+full.mod <- glm(churn ~ ., data = train, family = binomial(logit))
+step.mod <- stepAIC(full.mod, trace = FALSE)
+summary(step.mod)
+```
+
+## Lasso
+
+# gradient boosting
+```{r}
+gb.mod <- gbm(churn ~ mon_data_city + mon_voice_city +
+                data_roam_city + long_d_min_city + ph_num +
+                 data_plan_m8 + disc_m8 + serv_tick_m7to8 +
+                 data_roam + cr_score + day_since_st_date,
+               data = train, distribution = "bernoulli", n.trees = 2000, shrinkage = 0.005)
+summary(gb.mod)
+
+predict(gb.mod, test, n.tree = 1000)
+```
+
+
+# random forest
+```{r}
+
+full.rf <- randomForest(formula = churn ~ . ,
+                        data = train,
+                        importance = TRUE,
+                        ntree = 1500, mtry = 4)
+
+```
+
+# neural network
+```{r, results = FALSE}
+nn4 <- Nnet(formula = churn ~.,
+               data = train,
+               decay = 0.03, 
+               size = 7) 
+
+nn6 <- Nnet(formula = churn ~.,
+               data = train,
+               decay = 0.03, 
+               size = 8) 
+
+```
+
+
+# Performance Comparison
+```{r}
+#FULL MOD
+test$full.mod.pred <- predict(full.mod, test, type = "response")
+test$full.mod.pred <- ifelse(percent_rank(test$full.mod.pred)>= 0.6, "yes", "no")
+table(test$churn, test$full.mod.pred)
+
+#STEP MOD
+test$step.mod.pred <- predict(step.mod, test, type = "response")
+test$step.mod.pred <- ifelse(percent_rank(test$step.mod.pred) >= 0.6, "yes", "no")
+table(test$churn, test$step.mod.pred)
+
+
+#Full random forest
+test$rf.pred <- predict(full.rf, test, type = "prob")[, '1']
+test$rf.pred <- ifelse(percent_rank(test$rf.pred) >=0.6, "yes", "no")
+table(test$churn, test$rf.pred)
+
+# Nnet 4 
+test$nnet4.pred <- predict(nn4, test)
+test$nnet4.pred <- ifelse(percent_rank(test$nnet4.pred) >=0.6, "yes", "no")
+table(test$churn, test$nnet4.pred)
+
+# Nnet6
+test$nnet6.pred <- predict(nn6, test)
+test$nnet6.pred <- ifelse(percent_rank(test$nnet6.pred) >=0.6, "yes", "no")
+table(test$churn, test$nnet6.pred)
+
+```
+
+# lift chart
+```{r}
+lift.chart(modelList = c("step.mod", "nn4"),
+           data = test,
+           targLevel = 1, trueResp = 0.12,
+           type = "cumulative", sub = "Estimation")
+
+```
+
+
+# Saving csv files
+```{r}
+holdout$nnet4.pred <- predict(nn4, holdout)
+holdout$nnet6.pred <- predict(nn6, holdout)
+holdout$Score <- rowMeans(holdout$nnet4.pred, holdout$nnet6.pred)
+submision <- dplyr::select(holdout, ph_num, Score)
+head(submision)
+write.csv(submision, "Team16.csv")
+```
